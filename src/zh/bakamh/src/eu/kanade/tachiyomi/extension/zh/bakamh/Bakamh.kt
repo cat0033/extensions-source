@@ -55,8 +55,17 @@ abstract class Bakamh : Madara() {
     override suspend fun fetchChapterDocument(chapterUrl: String) = super.fetchChapterDocument(chapterUrl).also { document ->
         if (document.selectFirst(READER_CONFIG_SELECTOR) == null) return@also
         sendReaderBeacon(chapterUrl)
-        val url = document.selectFirst("script#mkjp-reader-window-js")!!.absUrl("src")
-        if (readerScript?.url != url) readerScript = ReaderScript(url, client.get(url).body.string())
+
+        // 如果页面中已经直接存在图片标签，则无需再下载远端 JS 解密脚本
+        val hasDirectImages = document.selectFirst("div.reading-content img[data-src], div.reading-content img[src]") != null
+        if (hasDirectImages) return@also
+
+        val scriptUrl = document.selectFirst("script#mkjp-reader-window-js")?.absUrl("src") ?: return@also
+        if (scriptUrl.isNotEmpty() && readerScript?.url != scriptUrl) {
+            runCatching {
+                readerScript = ReaderScript(scriptUrl, client.get(scriptUrl).body.string())
+            }
+        }
     }
 
     // The reader's mkjp_rv beacon; chapters read without it end in the site's third-party tool warning
@@ -72,8 +81,33 @@ abstract class Bakamh : Madara() {
             error(if (needsLogin) "需在 WebView 中登录，账号有封禁风险" else title.text())
         }
         document.selectFirst(".mkjp-tool-warning")?.let { error(it.text()) }
-        val config = document.selectFirst(READER_CONFIG_SELECTOR)!!.data()
+
+        // 1. 优先直接从 HTML 中抓取所有漫画图片（兼容 data-src, data-manga-src, src 等各种属性）
+        val pages = document.select("div.reading-content img, div.page-break img").mapNotNull { img ->
+            val url = img.attr("abs:data-src").ifEmpty {
+                img.attr("abs:data-manga-src").ifEmpty {
+                    img.attr("abs:data-lazy-src").ifEmpty {
+                        img.attr("abs:src")
+                    }
+                }
+            }.trim()
+            url.takeIf { it.isNotEmpty() && !it.startsWith("data:") }
+        }
+
+        if (pages.isNotEmpty()) {
+            return pages.mapIndexed { index, url -> Page(index, document.location(), url) }
+        }
+
+        // 2. 兜底方案：如果页面中确实没有图片，才尝试使用旧的 JS 脚本解密
+        val config = document.selectFirst(READER_CONFIG_SELECTOR)?.data()
         val slots = document.select(READER_SLOT_SELECTOR).size
-        return readerScript!!.pageUrls(config, slots).mapIndexed { index, url -> Page(index, document.location(), url) }
+        if (!config.isNullOrEmpty() && slots > 0 && readerScript != null) {
+            val scriptUrls = runCatching { readerScript!!.pageUrls(config, slots) }.getOrNull()
+            if (!scriptUrls.isNullOrEmpty()) {
+                return scriptUrls.mapIndexed { index, url -> Page(index, document.location(), url) }
+            }
+        }
+
+        error("Failed to read the page list")
     }
 }
